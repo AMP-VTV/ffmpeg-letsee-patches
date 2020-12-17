@@ -1,0 +1,117 @@
+--- af_adelay.c	2020-11-19 12:42:38.000000000 +0100
++++ af_adelay-modif.c	2020-12-15 16:16:41.648791900 +0100
+@@ -54,7 +54,7 @@
+ #define A AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+ 
+ static const AVOption adelay_options[] = {
+-    { "delays", "set list of delays for each channel", OFFSET(delays), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, A },
++    { "delays", "set list of delays for each channel", OFFSET(delays), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_RUNTIME_PARAM },
+     { "all",    "use last available delay for remained channels", OFFSET(all), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, A },
+     { NULL }
+ };
+@@ -212,6 +212,99 @@
+     return 0;
+ }
+ 
++static int delays_update(AVFilterContext *ctx, const char *cmd, const char *arg)
++{
++    AudioDelayContext *s = ctx->priv;
++    char *p, *saveptr = NULL;
++    int i;
++
++    if (!s->chandelay)
++        return AVERROR(ENOMEM);
++
++    p = s->delays;
++    for (i = 0; i < s->nb_delays; i++) {
++        ChanDelay *d = &s->chandelay[i];
++        float delay, div;
++        char type = 0;
++        int ret;
++
++        if (!(arg = av_strtok(p, "|", &saveptr)))
++            break;
++
++        p = NULL;
++
++        ret = av_sscanf(arg, "%d%c", &d->delay, &type);
++        if (ret != 2 || type != 'S') {
++            div = type == 's' ? 1.0 : 1000.0;
++            if (av_sscanf(arg, "%f", &delay) != 1) {
++                av_log(ctx, AV_LOG_ERROR, "Invalid syntax for delay, ignoring command.\n");
++                return 0;
++            }
++            d->delay = delay * ctx->inputs[0]->sample_rate / div;
++        }
++
++        if (d->delay < 0) {
++            av_log(ctx, AV_LOG_ERROR, "Delay must be non negative number, ignoring command.\n");
++            return 0;
++        }
++    }
++
++    if (s->all && i) {
++        for (int j = i; j < s->nb_delays; j++)
++            s->chandelay[j].delay = s->chandelay[i-1].delay;
++    }
++
++    s->padding = s->chandelay[0].delay;
++    for (i = 1; i < s->nb_delays; i++) {
++        ChanDelay *d = &s->chandelay[i];
++
++        s->padding = FFMIN(s->padding, d->delay);
++    }
++
++    if (s->padding) {
++        for (i = 0; i < s->nb_delays; i++) {
++            ChanDelay *d = &s->chandelay[i];
++
++            d->delay -= s->padding;
++        }
++    }
++
++    for (i = 0; i < s->nb_delays; i++) {
++        ChanDelay *d = &s->chandelay[i];
++
++        if (!d->delay)
++            continue;
++
++        d->samples =  av_realloc_array(d->samples, d->delay, s->block_align);
++        if (!d->samples)
++            return AVERROR(ENOMEM);
++
++        s->max_delay = FFMAX(s->max_delay, d->delay);
++    }
++
++    return 0;
++}
++
++static int process_command(AVFilterContext *ctx,
++                           const char *cmd,
++                           const char *arg,
++                           char *res,
++                           int res_len,
++                           int flags)
++{
++
++    int ret = AVERROR(ENOSYS);
++
++    av_log(ctx,AV_LOG_INFO,"received command '%s' with args '%s'\n", cmd, arg);
++    
++    ret = ff_filter_process_command(ctx, cmd, arg, res, res_len, flags);
++    
++    if (ret < 0)
++        return ret;
++
++    return delays_update(ctx, cmd, arg);
++}
++
+ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
+ {
+     AVFilterContext *ctx = inlink->dst;
+@@ -356,4 +449,5 @@
+     .inputs        = adelay_inputs,
+     .outputs       = adelay_outputs,
+     .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
++    .process_command = process_command,
+ };
